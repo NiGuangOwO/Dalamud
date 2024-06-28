@@ -91,7 +91,7 @@ internal class LocalPlugin : IDisposable
         }
 
         // Create an installation instance ID for this plugin, if it doesn't have one yet
-        if (this.manifest.WorkingPluginId == Guid.Empty)
+        if (this.manifest.WorkingPluginId == Guid.Empty && !this.IsDev)
         {
             this.manifest.WorkingPluginId = Guid.NewGuid();
 
@@ -162,7 +162,7 @@ internal class LocalPlugin : IDisposable
     /// INCLUDES the default profile.
     /// </summary>
     public bool IsWantedByAnyProfile =>
-        Service<ProfileManager>.Get().GetWantStateAsync(this.manifest.WorkingPluginId, this.Manifest.InternalName, false, false).GetAwaiter().GetResult();
+        Service<ProfileManager>.Get().GetWantStateAsync(this.EffectiveWorkingPluginId, this.Manifest.InternalName, false, false).GetAwaiter().GetResult();
 
     /// <summary>
     /// Gets a value indicating whether this plugin's API level is out of date.
@@ -178,7 +178,6 @@ internal class LocalPlugin : IDisposable
     /// Gets a value indicating whether or not this plugin is orphaned(belongs to a repo) or not.
     /// </summary>
     public bool IsOrphaned => !this.IsDev &&
-                              !this.manifest.InstalledFromUrl.IsNullOrEmpty() && // TODO(api8): Remove this, all plugins will have a proper flag
                               this.GetSourceRepository() == null;
 
     /// <summary>
@@ -214,6 +213,11 @@ internal class LocalPlugin : IDisposable
     /// Gets the effective version of this plugin.
     /// </summary>
     public Version EffectiveVersion => this.manifest.EffectiveVersion;
+
+    /// <summary>
+    /// Gets the effective working plugin ID for this plugin.
+    /// </summary>
+    public virtual Guid EffectiveWorkingPluginId => this.manifest.WorkingPluginId;
 
     /// <summary>
     /// Gets the service scope for this plugin.
@@ -271,11 +275,8 @@ internal class LocalPlugin : IDisposable
         await this.pluginLoadStateLock.WaitAsync();
         try
         {
-            if (reloading && this.IsDev)
-            {
-                // Reload the manifest in-case there were changes here too.
-                this.ReloadManifest();
-            }
+            if (reloading)
+                this.OnPreReload();
 
             // If we reload a plugin we don't want to delete it. Makes sense, right?
             if (this.manifest.ScheduledForDeletion)
@@ -411,28 +412,39 @@ internal class LocalPlugin : IDisposable
             this.ServiceScope = ioc.GetScope();
             this.ServiceScope.RegisterPrivateScopes(this); // Add this LocalPlugin as a private scope, so services can get it
 
-            if (this.manifest.LoadSync && this.manifest.LoadRequiredState is 0 or 1)
+            try
             {
-                this.instance = await framework.RunOnFrameworkThread(
-                                    () => this.ServiceScope.CreateAsync(this.pluginType!, this.DalamudInterface!)) as IDalamudPlugin;
+                if (this.manifest.LoadSync && this.manifest.LoadRequiredState is 0 or 1)
+                {
+                    this.instance = await framework.RunOnFrameworkThread(
+                                        () => this.ServiceScope.CreateAsync(
+                                            this.pluginType!,
+                                            this.DalamudInterface!)) as IDalamudPlugin;
+                }
+                else
+                {
+                    this.instance =
+                        await this.ServiceScope.CreateAsync(this.pluginType!, this.DalamudInterface!) as IDalamudPlugin;
+                }
             }
-            else
+            catch (Exception ex)
             {
-                this.instance =
-                    await this.ServiceScope.CreateAsync(this.pluginType!, this.DalamudInterface!) as IDalamudPlugin;
+                Log.Error(ex, "Exception in plugin constructor");
+                this.instance = null;
             }
 
             if (this.instance == null)
             {
                 this.State = PluginState.LoadError;
-                this.DalamudInterface.DisposeInternal();
+                this.UnloadAndDisposeState();
+                
                 Log.Error(
-                    $"Error while loading {this.Name}, failed to bind and call the plugin constructor");
+                    "Error while loading {PluginName}, failed to bind and call the plugin constructor", this.InternalName);
                 return;
             }
 
             this.State = PluginState.Loaded;
-            Log.Information($"Finished loading {this.DllFile.Name}");
+            Log.Information("Finished loading {PluginName}", this.InternalName);
         }
         catch (Exception ex)
         {
@@ -442,7 +454,7 @@ internal class LocalPlugin : IDisposable
             if (ex is PluginPreconditionFailedException)
                 Log.Warning(ex.Message);
             else
-                Log.Error(ex, $"Error while loading {this.Name}");
+                Log.Error(ex, "Error while loading {PluginName}", this.InternalName);
 
             throw;
         }
@@ -471,6 +483,7 @@ internal class LocalPlugin : IDisposable
             {
                 case PluginState.Unloaded:
                     throw new InvalidPluginOperationException($"Unable to unload {this.Name}, already unloaded");
+                case PluginState.DependencyResolutionFailed:
                 case PluginState.UnloadError:
                     if (!this.IsDev)
                     {
@@ -489,39 +502,42 @@ internal class LocalPlugin : IDisposable
             }
 
             this.State = PluginState.Unloading;
-            Log.Information($"Unloading {this.DllFile.Name}");
+            Log.Information("Unloading {PluginName}", this.InternalName);
 
-            if (this.manifest.CanUnloadAsync || framework == null)
-                this.instance?.Dispose();
-            else
-                await framework.RunOnFrameworkThread(() => this.instance?.Dispose());
-
-            this.instance = null;
-
-            this.DalamudInterface?.DisposeInternal();
-            this.DalamudInterface = null;
-
-            this.ServiceScope?.Dispose();
-            this.ServiceScope = null;
-
-            this.pluginType = null;
-            this.pluginAssembly = null;
-
-            if (!reloading)
+            try
             {
-                if (waitBeforeLoaderDispose && this.loader != null)
-                    await Task.Delay(configuration.PluginWaitBeforeFree ?? PluginManager.PluginWaitBeforeFreeDefault);
-                this.loader?.Dispose();
-                this.loader = null;
+                if (this.manifest.CanUnloadAsync || framework == null)
+                    this.instance?.Dispose();
+                else
+                    await framework.RunOnFrameworkThread(() => this.instance?.Dispose());
+            }
+            catch (Exception e)
+            {
+                this.State = PluginState.UnloadError;
+                Log.Error(e, "Could not unload {PluginName}, error in plugin dispose", this.InternalName);
+                return;
+            }
+            finally
+            {
+                this.instance = null;
+                this.UnloadAndDisposeState();
+                
+                if (!reloading)
+                {
+                    if (waitBeforeLoaderDispose && this.loader != null)
+                        await Task.Delay(configuration.PluginWaitBeforeFree ?? PluginManager.PluginWaitBeforeFreeDefault);
+                    this.loader?.Dispose();
+                    this.loader = null;
+                }
             }
 
             this.State = PluginState.Unloaded;
-            Log.Information($"Finished unloading {this.DllFile.Name}");
+            Log.Information("Finished unloading {PluginName}", this.InternalName);
         }
         catch (Exception ex)
         {
             this.State = PluginState.UnloadError;
-            Log.Error(ex, $"Error while unloading {this.Name}");
+            Log.Error(ex, "Error while unloading {PluginName}", this.InternalName);
 
             throw;
         }
@@ -579,24 +595,6 @@ internal class LocalPlugin : IDisposable
     }
 
     /// <summary>
-    /// Reload the manifest if it exists, preserve the internal Disabled state.
-    /// </summary>
-    public void ReloadManifest()
-    {
-        var manifestPath = LocalPluginManifest.GetManifestFile(this.DllFile);
-        if (manifestPath.Exists)
-        {
-            // Save some state that we do actually want to carry over
-            var guid = this.manifest.WorkingPluginId;
-            
-            this.manifest = LocalPluginManifest.Load(manifestPath) ?? throw new Exception("Could not reload manifest.");
-            this.manifest.WorkingPluginId = guid;
-
-            this.SaveManifest("dev reload");
-        }
-    }
-
-    /// <summary>
     /// Get the repository this plugin was installed from.
     /// </summary>
     /// <returns>The plugin repository this plugin was installed from, or null if it is no longer there or if the plugin is a dev plugin.</returns>
@@ -620,6 +618,13 @@ internal class LocalPlugin : IDisposable
     /// </summary>
     /// <param name="reason">Why it should be saved.</param>
     protected void SaveManifest(string reason) => this.manifest.Save(this.manifestFile, reason);
+    
+    /// <summary>
+    /// Called before a plugin is reloaded.
+    /// </summary>
+    protected virtual void OnPreReload()
+    {
+    }
 
     private static void SetupLoaderConfig(LoaderConfig config)
     {
@@ -690,5 +695,20 @@ internal class LocalPlugin : IDisposable
             Log.Error($"Nothing inherits from IDalamudPlugin: {this.DllFile.FullName}");
             throw new InvalidPluginException(this.DllFile);
         }
+    }
+    
+    private void UnloadAndDisposeState()
+    {
+        if (this.instance != null)
+            throw new InvalidOperationException("Plugin instance should be disposed at this point");
+        
+        this.DalamudInterface?.DisposeInternal();
+        this.DalamudInterface = null;
+
+        this.ServiceScope?.Dispose();
+        this.ServiceScope = null;
+
+        this.pluginType = null;
+        this.pluginAssembly = null;
     }
 }

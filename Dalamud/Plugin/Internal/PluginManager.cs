@@ -977,32 +977,36 @@ internal class PluginManager : IInternalDisposableService
     /// <summary>
     /// Update all non-dev plugins.
     /// </summary>
-    /// <param name="ignoreDisabled">Ignore disabled plugins.</param>
+    /// <param name="toUpdate">List of plugins to update.</param>
     /// <param name="dryRun">Perform a dry run, don't install anything.</param>
     /// <param name="autoUpdate">If this action was performed as part of an auto-update.</param>
+    /// <param name="progress">An <see cref="IProgress{T}"/> implementation to receive progress updates about the installation status.</param>
     /// <returns>Success or failure and a list of updated plugin metadata.</returns>
-    public async Task<IEnumerable<PluginUpdateStatus>> UpdatePluginsAsync(bool ignoreDisabled, bool dryRun, bool autoUpdate = false)
+    public async Task<IEnumerable<PluginUpdateStatus>> UpdatePluginsAsync(
+        ICollection<AvailablePluginUpdate> toUpdate,
+        bool dryRun,
+        bool autoUpdate = false,
+        IProgress<PluginUpdateProgress>? progress = null)
     {
         Log.Information("Starting plugin update");
 
         var updateTasks = new List<Task<PluginUpdateStatus>>();
+        var totalPlugins = toUpdate.Count;
+        var processedPlugins = 0;
 
         // Prevent collection was modified errors
         lock (this.pluginListLock)
         {
-            foreach (var plugin in this.updatablePluginsList)
+            foreach (var plugin in toUpdate)
             {
                 // Can't update that!
                 if (plugin.InstalledPlugin.IsDev)
                     continue;
 
-                if (!plugin.InstalledPlugin.IsWantedByAnyProfile && ignoreDisabled)
-                    continue;
-
                 if (plugin.InstalledPlugin.Manifest.ScheduledForDeletion)
                     continue;
 
-                updateTasks.Add(this.UpdateSinglePluginAsync(plugin, false, dryRun));
+                updateTasks.Add(UpdateSinglePluginWithProgressAsync(plugin));
             }
         }
 
@@ -1013,9 +1017,26 @@ internal class PluginManager : IInternalDisposableService
             autoUpdate ? PluginListInvalidationKind.AutoUpdate : PluginListInvalidationKind.Update,
             updatedList.Select(x => x.InternalName));
 
-        Log.Information("Plugin update OK. {updateCount} plugins updated.", updatedList.Length);
+        Log.Information("Plugin update OK. {UpdateCount} plugins updated", updatedList.Length);
 
         return updatedList;
+
+        async Task<PluginUpdateStatus> UpdateSinglePluginWithProgressAsync(AvailablePluginUpdate plugin)
+        {
+            var result = await this.UpdateSinglePluginAsync(plugin, false, dryRun);
+
+            // Update the progress
+            if (progress != null)
+            {
+                var newProcessedAmount = Interlocked.Increment(ref processedPlugins);
+                progress.Report(new PluginUpdateProgress(
+                                    newProcessedAmount,
+                                    totalPlugins,
+                                    plugin.InstalledPlugin.Manifest));
+            }
+
+            return result;
+        }
     }
 
     /// <summary>
@@ -1029,7 +1050,7 @@ internal class PluginManager : IInternalDisposableService
     {
         var plugin = metadata.InstalledPlugin;
 
-        var workingPluginId = metadata.InstalledPlugin.Manifest.WorkingPluginId;
+        var workingPluginId = metadata.InstalledPlugin.EffectiveWorkingPluginId;
         if (workingPluginId == Guid.Empty)
             throw new Exception("Existing plugin had no WorkingPluginId");
 
@@ -1331,16 +1352,16 @@ internal class PluginManager : IInternalDisposableService
         
         foreach (var installedPlugin in this.InstalledPlugins)
         {
-            if (installedPlugin.Manifest.WorkingPluginId == Guid.Empty)
+            if (installedPlugin.EffectiveWorkingPluginId == Guid.Empty)
                 throw new Exception($"{(installedPlugin is LocalDevPlugin ? "DevPlugin" : "Plugin")} '{installedPlugin.Manifest.InternalName}' has an empty WorkingPluginId.");
 
-            if (seenIds.Contains(installedPlugin.Manifest.WorkingPluginId))
+            if (seenIds.Contains(installedPlugin.EffectiveWorkingPluginId))
             {
                 throw new Exception(
-                    $"{(installedPlugin is LocalDevPlugin ? "DevPlugin" : "Plugin")} '{installedPlugin.Manifest.InternalName}' has a duplicate WorkingPluginId '{installedPlugin.Manifest.WorkingPluginId}'");
+                    $"{(installedPlugin is LocalDevPlugin ? "DevPlugin" : "Plugin")} '{installedPlugin.Manifest.InternalName}' has a duplicate WorkingPluginId '{installedPlugin.EffectiveWorkingPluginId}'");
             }
             
-            seenIds.Add(installedPlugin.Manifest.WorkingPluginId);
+            seenIds.Add(installedPlugin.EffectiveWorkingPluginId);
         }
         
         this.profileManager.ParanoiaValidateProfiles();
@@ -1388,7 +1409,7 @@ internal class PluginManager : IInternalDisposableService
             {
                 // Only remove entries from the default profile that are NOT currently tied to an active LocalPlugin
                 var guidsToRemove = this.profileManager.DefaultProfile.Plugins
-                                        .Where(x => this.InstalledPlugins.All(y => y.Manifest.WorkingPluginId != x.WorkingPluginId))
+                                        .Where(x => this.InstalledPlugins.All(y => y.EffectiveWorkingPluginId != x.WorkingPluginId))
                                         .Select(x => x.WorkingPluginId)
                                         .ToArray();
 
@@ -1560,9 +1581,9 @@ internal class PluginManager : IInternalDisposableService
         // This will also happen if you are installing a plugin with the installer, and that's intended!
         // It means that, if you have a profile which has unsatisfied plugins, installing a matching plugin will
         // enter it into the profiles it can match.
-        if (plugin.Manifest.WorkingPluginId == Guid.Empty)
+        if (plugin.EffectiveWorkingPluginId == Guid.Empty)
             throw new Exception("Plugin should have a WorkingPluginId at this point");
-        this.profileManager.MigrateProfilesToGuidsForPlugin(plugin.Manifest.InternalName, plugin.Manifest.WorkingPluginId);
+        this.profileManager.MigrateProfilesToGuidsForPlugin(plugin.Manifest.InternalName, plugin.EffectiveWorkingPluginId);
         
         var wantedByAnyProfile = false;
 
@@ -1573,7 +1594,7 @@ internal class PluginManager : IInternalDisposableService
             loadPlugin &= !isBoot;
 
             var wantsInDefaultProfile =
-                this.profileManager.DefaultProfile.WantsPlugin(plugin.Manifest.WorkingPluginId);
+                this.profileManager.DefaultProfile.WantsPlugin(plugin.EffectiveWorkingPluginId);
             if (wantsInDefaultProfile == null)
             {
                 // We don't know about this plugin, so we don't want to do anything here.
@@ -1582,7 +1603,7 @@ internal class PluginManager : IInternalDisposableService
                 
                 // Check if any profile wants this plugin. We need to do this here, since we want to allow loading a dev plugin if a non-default profile wants it active.
                 // Note that this will not add the plugin to the default profile. That's done below in any other case.
-                wantedByAnyProfile = await this.profileManager.GetWantStateAsync(plugin.Manifest.WorkingPluginId, plugin.Manifest.InternalName, false, false);
+                wantedByAnyProfile = await this.profileManager.GetWantStateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, false, false);
                 
                 // If it is wanted by any other profile, we do want to load it.
                 if (wantedByAnyProfile)
@@ -1592,28 +1613,28 @@ internal class PluginManager : IInternalDisposableService
             {
                 // We didn't want this plugin, and StartOnBoot is on. That means we don't want it and it should stay off until manually enabled.
                 Log.Verbose("DevPlugin {Name} disabled and StartOnBoot => disable", plugin.Manifest.InternalName);
-                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.Manifest.WorkingPluginId, plugin.Manifest.InternalName, false, false);
+                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, false, false);
                 loadPlugin = false;
             }
             else if (wantsInDefaultProfile == true && devPlugin.StartOnBoot)
             {
                 // We wanted this plugin, and StartOnBoot is on. That means we actually do want it.
                 Log.Verbose("DevPlugin {Name} enabled and StartOnBoot => enable", plugin.Manifest.InternalName);
-                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.Manifest.WorkingPluginId, plugin.Manifest.InternalName, true, false);
+                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, true, false);
                 loadPlugin = !doNotLoad;
             }
             else if (wantsInDefaultProfile == true && !devPlugin.StartOnBoot)
             {
                 // We wanted this plugin, but StartOnBoot is off. This means we don't want it anymore.
                 Log.Verbose("DevPlugin {Name} enabled and !StartOnBoot => disable", plugin.Manifest.InternalName);
-                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.Manifest.WorkingPluginId, plugin.Manifest.InternalName, false, false);
+                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, false, false);
                 loadPlugin = false;
             }
             else if (wantsInDefaultProfile == false && !devPlugin.StartOnBoot)
             {
                 // We didn't want this plugin, and StartOnBoot is off. We don't want it.
                 Log.Verbose("DevPlugin {Name} disabled and !StartOnBoot => disable", plugin.Manifest.InternalName);
-                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.Manifest.WorkingPluginId, plugin.Manifest.InternalName, false, false);
+                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, false, false);
                 loadPlugin = false;
             }
 
@@ -1626,7 +1647,7 @@ internal class PluginManager : IInternalDisposableService
         
         // Plugins that aren't in any profile will be added to the default profile with this call.
         // We are skipping a double-lookup for dev plugins that are wanted by non-default profiles, as noted above.
-        wantedByAnyProfile = wantedByAnyProfile || await this.profileManager.GetWantStateAsync(plugin.Manifest.WorkingPluginId, plugin.Manifest.InternalName, defaultState);
+        wantedByAnyProfile = wantedByAnyProfile || await this.profileManager.GetWantStateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, defaultState);
         Log.Information("{Name} defaultState: {State} wantedByAnyProfile: {WantedByAny} loadPlugin: {LoadPlugin}", plugin.Manifest.InternalName, defaultState, wantedByAnyProfile, loadPlugin);
         
         if (loadPlugin)
@@ -1831,6 +1852,11 @@ internal class PluginManager : IInternalDisposableService
             Log.Error(ex, "Plugin load failed");
         }
     }
+    
+    /// <summary>
+    /// Class representing progress of an update operation.
+    /// </summary>
+    public record PluginUpdateProgress(int PluginsProcessed, int TotalPlugins, IPluginManifest CurrentPluginManifest);
     
     /// <summary>
     /// Simple class that tracks the internal names and public names of plugins that we are planning to load at startup,
