@@ -1,9 +1,13 @@
 using System.Diagnostics.CodeAnalysis;
 
 using CheapLoc;
-
+using Dalamud.Bindings.ImGui;
+using Dalamud.Configuration.Internal;
 using Dalamud.Game.Text;
 using Dalamud.Interface.Internal.Windows.Settings.Widgets;
+using Dalamud.Interface.Utility;
+using Dalamud.Plugin.Internal;
+using Dalamud.Plugin.Internal.Types;
 using Dalamud.Utility.Internal;
 
 namespace Dalamud.Interface.Internal.Windows.Settings.Tabs;
@@ -84,8 +88,6 @@ internal sealed class SettingsTabGeneral : SettingsTab
         
         new GapSettingsEntry(5),
     ];
-
-    public override string Title => Loc.Localize("DalamudSettingsGeneral", "General");
     
     public override void Draw()
     {

@@ -55,22 +55,14 @@ internal sealed class SettingsTabExperimental : SettingsTab
         new DevPluginsSettingsEntry(),
 
         new SettingsEntry<bool>(
-            Loc.Localize(
-                "DalamudSettingEnableImGuiAsserts",
-                "启用 ImGui 断言"),
-            Loc.Localize(
-                "DalamudSettingEnableImGuiAssertsHint",
-                "启用后, 当 ImGui 出现内部断言失败时, 将会弹出一个包含相关详细信息的窗口\n如果你并非开发者, 请勿启用本项"),
+            "启用 ImGui 断言",
+            "启用后, 当 ImGui 出现内部断言失败时, 将会弹出一个包含相关详细信息的窗口\n如果你并非开发者, 请勿启用本项",
             c => Service<InterfaceManager>.Get().ShowAsserts,
             (v, _) => Service<InterfaceManager>.Get().ShowAsserts = v),
 
         new SettingsEntry<bool>(
-            Loc.Localize(
-                "DalamudSettingEnableImGuiAssertsAtStartup",
-                "总是在 Dalamud 注入时启用 ImGui 断言"),
-            Loc.Localize(
-                "DalamudSettingEnableImGuiAssertsAtStartupHint",
-                "启用后, 每当 Dalamud 注入游戏时, 都会启用 ImGui 断言"),
+            "总是在 Dalamud 注入时启用 ImGui 断言",
+            "启用后, 每当 Dalamud 注入游戏时, 都会启用 ImGui 断言",
             c => c.ImGuiAssertsEnabledAtStartup ?? false,
             (v, c) => c.ImGuiAssertsEnabledAtStartup = v),
 
